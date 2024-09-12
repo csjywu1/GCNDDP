@@ -79,19 +79,24 @@ def generate_single_negative_samples(train_neg_samples, pos_samples, num_nodes, 
     return neg_samples
 
 def load_data():
-    with open('data_val/train_mat', 'rb') as f:
+    with open('data/train_mat_fold0', 'rb') as f:
         train = pickle.load(f)
-    with open('data_val/test_mat', 'rb') as f:
+    with open('data/test_mat_fold0', 'rb') as f:
         test = pickle.load(f)
-    with open('data_val/val_mat', 'rb') as f:
-        val = pickle.load(f)
+    # with open('data_val/val_mat', 'rb') as f:
+    #     val = pickle.load(f)
 
+    # 将数据类型转换为 float64
     train = train.astype(np.float64)
     test = test.astype(np.float64)
-    val = val.astype(np.float64)
+    # val = val.astype(np.float64)
 
     # 将验证集和测试集合并
-    test = test + val
+    # test = test + val
+
+    # 转置矩阵，使药物为行，基因为列
+    train = train.T
+    test = test.T
 
     return train, test
 
@@ -124,7 +129,7 @@ def train_model(train_loader, model, optimizer, train_neg_samples, num_epochs, t
     best_loss = float('inf')
     best_model_path = 'best_model.pth'
 
-    def extract_gene_gene_relationships(pos, geneids):
+    def extract_gene_gene_relationships(pos, geneids, max_neighbors=5):
         # Create a dictionary to store the genes associated with each drug
         drug_to_genes = {}
 
@@ -140,8 +145,15 @@ def train_model(train_loader, model, optimizer, train_neg_samples, num_epochs, t
         # Iterate over drugs and their associated genes
         for genes in drug_to_genes.values():
             if len(genes) > 1:
-                # Create all gene pairs without calling itertools on each iteration
+                # Limit to max_neighbors if more than max_neighbors genes
                 gene_list = sorted(genes)
+                if len(gene_list) > max_neighbors:
+                    gene_list = random.sample(gene_list, max_neighbors)
+                elif len(gene_list) < max_neighbors:
+                    # Replicate neighbors to reach max_neighbors
+                    gene_list += random.choices(gene_list, k=max_neighbors - len(gene_list))
+
+                # Create all gene pairs without calling itertools on each iteration
                 gene_gene_relationships.update(
                     (gene_list[i], gene_list[j])
                     for i in range(len(gene_list))
@@ -150,22 +162,12 @@ def train_model(train_loader, model, optimizer, train_neg_samples, num_epochs, t
 
         return list(gene_gene_relationships)
 
-    # Assuming train_data.rows contains geneids and train_data.cols contains pos
-    gene_gene_relationships = extract_gene_gene_relationships(train_data.cols, train_data.rows)
-    drug_drug_relationships = extract_gene_gene_relationships(train_data.rows, train_data.cols)
+    # Assuming train_data.rows contains geneids and train_data.cols contains pos # 3227 * 5 10690 * 5
+    sampled_drug_drug_relationships = extract_gene_gene_relationships(train_data.rows, train_data.cols,
+                                                              max_neighbors=100)  #
+    sampled_gene_gene_relationships = extract_gene_gene_relationships(train_data.cols, train_data.rows,
+                                                              max_neighbors=40)  #
 
-    # train_data
-    # 假设 gene_gene_relationships 是一个列表或张量，其中包含基因之间的关系
-    # 随机选取 1/10 的基因关系
-    num_relationships = len(drug_drug_relationships)  # 计算总关系数
-    sample_size = max(1, num_relationships // 100)  # 确保至少选取1个关系
-
-    num_relationships = len(gene_gene_relationships)  # 计算总关系数
-    sample_size1 = max(1, num_relationships // 10)  # 确保至少选取1个关系
-
-    # 从 gene_gene_relationships 中随机选取 sample_size 数量的关系
-    sampled_drug_drug_relationships = random.sample(drug_drug_relationships, sample_size)
-    sampled_gene_gene_relationships = random.sample(gene_gene_relationships, sample_size1)
 
     for epoch in range(num_epochs):
         epoch_loss = 0
@@ -246,27 +248,9 @@ def evaluate_model(model, test_pos_samples, test_neg_samples):
     auroc = auc(fpr, tpr)
 
 
-    # 通过 Youden's J 统计量找到最佳阈值
-    J = tpr - fpr
-    best_threshold_index = np.argmax(J)
-    best_threshold = thresholds[best_threshold_index]
 
-    # 计算 Precision-Recall 曲线和 AUPR
-    precision, recall, pr_thresholds = precision_recall_curve(all_labels, all_predictions)
-    aupr = auc(recall, precision)
 
-    # 通过最大化 F1-score 找到最佳阈值
-    f1_scores = 2 * (precision * recall) / (precision + recall)
-    best_f1_index = np.argmax(f1_scores)
-    best_threshold = pr_thresholds[best_f1_index]
-
-    # 使用最佳阈值计算精度和召回率
-    binary_predictions = (all_predictions >= best_threshold).astype(int)
-    precision_at_best_threshold = precision_score(all_labels, binary_predictions)
-    recall_at_best_threshold = recall_score(all_labels, binary_predictions)
-    f1_at_best_threshold = f1_score(all_labels, binary_predictions)
-
-    print(f"AUROC: {auroc}, AUPR: {aupr}, Precision: {precision_at_best_threshold}, Recall: {recall_at_best_threshold}, F1-score: {f1_at_best_threshold}")
+    print(f"AUROC: {auroc}")
 
 
 class TrnData(data.Dataset):
