@@ -73,7 +73,7 @@ class GCNDDP(nn.Module):
             return pred, self.E_g_GNN, self.E_d_GNN
         else:  # training phase
             E_d_GNN_0 = self.attention_layer2(self.E_d_GNN_0, sampled_drug_drug_relationships)
-            E_d_GNN_0 = 0.1 * E_d_GNN_0 + self.E_d_GNN_0
+            E_d_GNN_0 = E_d_GNN_0 + self.E_d_GNN_0
             # E_d_GNN_0 = torch.cat([E_d_GNN_0, self.E_d_GNN_0], dim=-1)
 
             # E_d_GNN_0 = self.concat_mlp1(E_d_GNN_0)
@@ -89,7 +89,7 @@ class GCNDDP(nn.Module):
             # sampled_gene_gene_relationships = random.sample(gene_gene_relationships, sample_size)
             #
             E_g_GNN_0 = self.attention_layer2(self.E_g_GNN_0, sampled_gene_gene_relationships)
-            E_g_GNN_0 = 0.1 * E_g_GNN_0 +  self.E_g_GNN_0
+            E_g_GNN_0 = E_g_GNN_0 +  self.E_g_GNN_0
 
 
 
