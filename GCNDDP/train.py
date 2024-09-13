@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument('--inter_batch', default=600, type=int, help='batch size')  # 4096 37514  600
     parser.add_argument('--note', default=None, type=str, help='note')
     parser.add_argument('--lambda1', default=1e-3, type=float, help='weight of cl loss')  # 0.05
-    parser.add_argument('--epoch', default=30, type=int, help='number of epochs') #50 10
+    parser.add_argument('--epoch', default=50, type=int, help='number of epochs') #50 10
     parser.add_argument('--d', default=256, type=int, help='embedding size')  # 512 0.886
     parser.add_argument('--q', default=5, type=int, help='rank')
     parser.add_argument('--gnn_layer', default=2, type=int, help='number of gnn layers')  # 2
