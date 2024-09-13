@@ -128,9 +128,9 @@ class GCNDDP(nn.Module):
 
             # total loss
             # loss = loss_reg + self.lambda_1 * loss_s  + loss_r
-            loss = self.lambda_1 * loss_s + loss_r
+            loss = loss_r
 
-            return loss, loss_r, self.lambda_1 * loss_s
+            return loss, loss_r
 
 
 
