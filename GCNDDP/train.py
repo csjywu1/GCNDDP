@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument('--inter_batch', default=600, type=int, help='batch size')  # 4096 37514  600
     parser.add_argument('--note', default=None, type=str, help='note')
     parser.add_argument('--lambda1', default=1e-3, type=float, help='weight of cl loss')  # 0.05
-    parser.add_argument('--epoch', default=50, type=int, help='number of epochs') #50 10
+    parser.add_argument('--epoch', default=100, type=int, help='number of epochs') #50 10
     parser.add_argument('--d', default=256, type=int, help='embedding size')  # 512 0.886
     parser.add_argument('--q', default=5, type=int, help='rank')
     parser.add_argument('--gnn_layer', default=2, type=int, help='number of gnn layers')  # 2
@@ -187,21 +187,18 @@ def train_model(train_loader, model, optimizer, train_neg_samples, num_epochs, t
             iids = torch.concat([pos, neg], dim=0)
 
             optimizer.zero_grad()
-            loss, loss_r, loss_s = model(drugids, iids, pos, neg,  sampled_gene_gene_relationships,sampled_drug_drug_relationships, train_data)
+            loss, loss_r= model(drugids, iids, pos, neg,  sampled_gene_gene_relationships,sampled_drug_drug_relationships, train_data)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.cpu().item()
             epoch_loss_r += loss_r.cpu().item()
-            epoch_loss_s += loss_s.cpu().item()
 
         batch_no = len(train_loader)
         epoch_loss = epoch_loss / batch_no
         epoch_loss_r = epoch_loss_r / batch_no
-        epoch_loss_s = epoch_loss_s / batch_no
         loss_list.append(epoch_loss)
         loss_r_list.append(epoch_loss_r)
-        loss_s_list.append(epoch_loss_s)
-        print(f'Epoch {epoch + 1}/{num_epochs} Loss: {epoch_loss} Loss_r: {epoch_loss_r} Loss_s: {epoch_loss_s}')
+        print(f'Epoch {epoch + 1}/{num_epochs} Loss: {epoch_loss} Loss_r: {epoch_loss_r} ')
 
         # Check if we have a new best loss
         # Check if we have a new best loss
