@@ -2,12 +2,12 @@ import itertools
 import random
 from collections import defaultdict
 
+from sklearn.model_selection import train_test_split
 import numpy as np
 import torch
 import pickle
 from scipy.sparse import coo_matrix
-
-import model_diffusion
+from model_diffusion import GCNDDP_diffusion
 from utils import metrics, scipy_sparse_mat_to_torch_sparse_tensor, mm_auc
 from tqdm import tqdm
 import torch.utils.data as data
@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument('--inter_batch', default=600, type=int, help='batch size')  # 4096 37514  600
     parser.add_argument('--note', default=None, type=str, help='note')
     parser.add_argument('--lambda1', default=1e-3, type=float, help='weight of cl loss')  # 0.05
-    parser.add_argument('--epoch', default=40, type=int, help='number of epochs') #50
+    parser.add_argument('--epoch', default=5, type=int, help='number of epochs') #50 10 3
     parser.add_argument('--d', default=256, type=int, help='embedding size')  # 512 0.886
     parser.add_argument('--q', default=5, type=int, help='rank')
     parser.add_argument('--gnn_layer', default=2, type=int, help='number of gnn layers')  # 2
@@ -80,19 +80,19 @@ def generate_single_negative_samples(train_neg_samples, pos_samples, num_nodes, 
     return neg_samples
 
 def load_data():
-    with open('data_val/train_mat', 'rb') as f:
+    with open('data/train_mat_fold0', 'rb') as f:
         train = pickle.load(f)
-    with open('data_val/test_mat', 'rb') as f:
+    with open('data/test_mat_fold0', 'rb') as f:
         test = pickle.load(f)
-    with open('data_val/val_mat', 'rb') as f:
-        val = pickle.load(f)
 
+    # 将数据类型转换为 float64
     train = train.astype(np.float64)
     test = test.astype(np.float64)
-    val = val.astype(np.float64)
 
-    # 将验证集和测试集合并
-    test = test + val
+
+    # 转置矩阵，使药物为行，基因为列
+    train = train.T
+    test = test.T
 
     return train, test
 
@@ -122,15 +122,18 @@ def train_model(train_loader, model, optimizer, train_neg_samples, num_epochs, t
     loss_list = []
     loss_r_list = []
     loss_s_list = []
+    consistency_loss_list = []
     best_loss = float('inf')
     best_model_path = 'best_model.pth'
 
-    def extract_gene_gene_relationships(pos, geneids):
+    import random
+
+    def extract_gene_gene_relationships(drugs, genes, max_neighbors=5):
         # Create a dictionary to store the genes associated with each drug
         drug_to_genes = {}
 
         # Populate the drug_to_genes dictionary
-        for gene, drug in zip(geneids, pos):
+        for drug, gene in zip(drugs, genes):
             if drug not in drug_to_genes:
                 drug_to_genes[drug] = set()
             drug_to_genes[drug].add(gene)
@@ -139,10 +142,17 @@ def train_model(train_loader, model, optimizer, train_neg_samples, num_epochs, t
         gene_gene_relationships = set()
 
         # Iterate over drugs and their associated genes
-        for genes in drug_to_genes.values():
-            if len(genes) > 1:
+        for genes_set in drug_to_genes.values():
+            if len(genes_set) > 1:
+                # Limit to max_neighbors if more than max_neighbors genes
+                gene_list = sorted(genes_set)
+                if len(gene_list) > max_neighbors:
+                    gene_list = random.sample(gene_list, max_neighbors)
+                elif len(gene_list) < max_neighbors:
+                    # Replicate neighbors to reach max_neighbors
+                    gene_list += random.choices(gene_list, k=max_neighbors - len(gene_list))
+
                 # Create all gene pairs without calling itertools on each iteration
-                gene_list = sorted(genes)
                 gene_gene_relationships.update(
                     (gene_list[i], gene_list[j])
                     for i in range(len(gene_list))
@@ -151,123 +161,128 @@ def train_model(train_loader, model, optimizer, train_neg_samples, num_epochs, t
 
         return list(gene_gene_relationships)
 
-    # Assuming train_data.rows contains geneids and train_data.cols contains pos
-    gene_gene_relationships = extract_gene_gene_relationships(train_data.cols, train_data.rows)
-    drug_drug_relationships = extract_gene_gene_relationships(train_data.rows, train_data.cols)
-
-    # train_data
-    # 假设 gene_gene_relationships 是一个列表或张量，其中包含基因之间的关系
-    # 随机选取 1/10 的基因关系
-    num_relationships = len(drug_drug_relationships)  # 计算总关系数
-    sample_size = max(1, num_relationships // 100)  # 确保至少选取1个关系
-
-    num_relationships = len(gene_gene_relationships)  # 计算总关系数
-    sample_size1 = max(1, num_relationships // 10)  # 确保至少选取1个关系
-
-    # 从 gene_gene_relationships 中随机选取 sample_size 数量的关系
-    sampled_drug_drug_relationships = random.sample(drug_drug_relationships, sample_size)
-    sampled_gene_gene_relationships = random.sample(gene_gene_relationships, sample_size1)
+    # Assuming train_data.rows contains drugs and train_data.cols contains genes
+    drugs = train_data.rows
+    genes = train_data.cols
+    sampled_gene_gene_relationships = extract_gene_gene_relationships(drugs, genes,
+                                                                      max_neighbors=10) #100 40
+    sampled_drug_drug_relationships = extract_gene_gene_relationships(genes, drugs,
+                                                                      max_neighbors=30) #40 100
 
     for epoch in range(num_epochs):
         epoch_loss = 0
         epoch_loss_r = 0
         epoch_loss_s = 0
+        epoch_consistency_loss=0
+
+        epoch_drugids = set()  # 用于记录每个 epoch 内的 drugids
 
         for i, batch in enumerate(train_loader):  #, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True tqdm(train_loader)
 
             # 从geneids构建同质图进行交互
 
 
-            geneids, pos = batch
+            drugids, pos = batch
             # 假设 geneids 和 pos 是已给的列表
 
-            neg = [train_neg_samples[geneid.item()][epoch][0] for geneid in geneids]  # 按 epoch 获取负样本
-            geneids = geneids.long().cuda(torch.device(device))
+            neg = [train_neg_samples[drugid.item()][epoch][0] for drugid in drugids]  # 按 epoch 获取负样本
+            drugids = drugids.long().cuda(torch.device(device))
             pos = pos.long().cuda(torch.device(device))
             neg = torch.tensor(neg).long().cuda(torch.device(device))
             iids = torch.concat([pos, neg], dim=0)
 
+            # 统计 drugids
+            epoch_drugids.update(drugids.tolist())
             optimizer.zero_grad()
-            loss, loss_r, loss_s = model(geneids, iids, pos, neg,  sampled_gene_gene_relationships,sampled_drug_drug_relationships, train_data)
+            loss, loss_r, loss_s, consistency_loss = model(drugids, iids, pos, neg,  sampled_gene_gene_relationships,sampled_drug_drug_relationships, train_data)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.cpu().item()
             epoch_loss_r += loss_r.cpu().item()
             epoch_loss_s += loss_s.cpu().item()
+            epoch_consistency_loss += consistency_loss.cpu().item()
+
+        # 统计每个 epoch 中 drugids 的范围和数量
+        min_drugid = min(epoch_drugids)
+        max_drugid = max(epoch_drugids)
+        num_drugids = len(epoch_drugids)
+
+        print(f"Epoch {epoch + 1}:")
+        print(f"DrugIDs range: {min_drugid} - {max_drugid}")
+        print(f"Number of unique DrugIDs: {num_drugids}")
+
 
         batch_no = len(train_loader)
         epoch_loss = epoch_loss / batch_no
         epoch_loss_r = epoch_loss_r / batch_no
         epoch_loss_s = epoch_loss_s / batch_no
+        epoch_consistency_loss = epoch_consistency_loss / batch_no
         loss_list.append(epoch_loss)
         loss_r_list.append(epoch_loss_r)
         loss_s_list.append(epoch_loss_s)
-        print(f'Epoch {epoch + 1}/{num_epochs} Loss: {epoch_loss} Loss_r: {epoch_loss_r} Loss_s: {epoch_loss_s}')
+        consistency_loss_list.append(epoch_consistency_loss)
+        print(f'Epoch {epoch + 1}/{num_epochs} Loss: {epoch_loss} Loss_r: {epoch_loss_r} Loss_s: {epoch_loss_s} Loss_con: {epoch_consistency_loss}')
 
         # Check if we have a new best loss
         # Check if we have a new best loss
         if epoch_loss < best_loss:
             best_loss = epoch_loss
             best_epoch = epoch + 1  # Save the epoch (1-based)
-            torch.save(model.state_dict(), best_model_path)
-            print(f'Saved new best model with loss {best_loss} at epoch {best_epoch}')
+    # torch.save(model.state_dict(), best_model_path)
+    # 保存模型和 neg_samples_dict 一起
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'neg_samples_dict': model.neg_samples_dict
+    }, best_model_path)
+
+    print(f'Saved new best model with loss {best_loss} at epoch {best_epoch}')
     return model, best_model_path, best_epoch
 
 
-def evaluate_model(model, test_pos_samples, test_neg_samples):
+def evaluate_model(model, test_pos_samples, test_neg_samples, batch_size=600):
     model.eval()
     all_predictions = []
     all_labels = []
 
-    # 计算正样本
-    for (i, j) in test_pos_samples:
-        gene_id = torch.tensor([i]).long().cuda(torch.device(device))
-        drug_id = torch.tensor([j]).long().cuda(torch.device(device))
-        pred, _, _ = model(gene_id, drug_id, None, None, None, None, test=True)
-        pred = pred.detach().cpu().numpy()  # 使用 detach() 来获取不需要梯度的张量
+    # 处理批量正样本
+    for batch_start in range(0, len(test_pos_samples), batch_size):
+        batch_samples = test_pos_samples[batch_start:batch_start + batch_size]
+        drug_ids, gene_ids = zip(*batch_samples)
+        drug_ids = torch.tensor(drug_ids).long().cuda()
+        gene_ids = torch.tensor(gene_ids).long().cuda()
+        preds, _, _ = model(gene_ids, drug_ids, None, None, None, None, test=True)
 
-        all_predictions.append(pred)
-        all_labels.append(1)
+        # 确保 preds 是一维数组，并且不包含多维元素
+        preds = preds.detach().cpu().numpy().ravel()
 
-    # 计算负样本
-    for i in test_neg_samples:
-        gene_id = torch.tensor([i]).long().cuda(torch.device(device))
-        for j in test_neg_samples[i]:
-            drug_id = torch.tensor([j]).long().cuda(torch.device(device))
-            pred, _, _ = model(gene_id, drug_id, None, None, None,None, test=True)
-            pred = pred.detach().cpu().numpy()  # 使用 detach() 来获取不需要梯度的张量
+        all_predictions.extend(preds)
+        all_labels.extend([1] * len(preds))
 
-            all_predictions.append(pred)
-            all_labels.append(0)
+    # 处理批量负样本
+    for drug_id, gene_ids in test_neg_samples.items():
+        for batch_start in range(0, len(gene_ids), batch_size):
+            batch_gene_ids = gene_ids[batch_start:batch_start + batch_size]
+            batch_drug_ids = [drug_id] * len(batch_gene_ids)
+            drug_ids = torch.tensor(batch_drug_ids).long().cuda()
+            gene_ids = torch.tensor(batch_gene_ids).long().cuda()
+            preds, _, _ = model(gene_ids, drug_ids, None, None, None, None, test=True)
 
+            # 确保 preds 是一维数组，并且不包含多维元素
+            preds = preds.detach().cpu().numpy().ravel()
+
+            all_predictions.extend(preds)
+            all_labels.extend([0] * len(preds))
+
+    # 将 all_predictions 和 all_labels 转换为一维数组
     all_predictions = np.array(all_predictions).ravel()
     all_labels = np.array(all_labels).ravel()
 
+    # 计算 ROC 曲线和 AUROC
     fpr, tpr, thresholds = roc_curve(all_labels, all_predictions)
     auroc = auc(fpr, tpr)
 
-
-    # 通过 Youden's J 统计量找到最佳阈值
-    J = tpr - fpr
-    best_threshold_index = np.argmax(J)
-    best_threshold = thresholds[best_threshold_index]
-
-    # 计算 Precision-Recall 曲线和 AUPR
-    precision, recall, pr_thresholds = precision_recall_curve(all_labels, all_predictions)
-    aupr = auc(recall, precision)
-
-    # 通过最大化 F1-score 找到最佳阈值
-    f1_scores = 2 * (precision * recall) / (precision + recall)
-    best_f1_index = np.argmax(f1_scores)
-    best_threshold = pr_thresholds[best_f1_index]
-
-    # 使用最佳阈值计算精度和召回率
-    binary_predictions = (all_predictions >= best_threshold).astype(int)
-    precision_at_best_threshold = precision_score(all_labels, binary_predictions)
-    recall_at_best_threshold = recall_score(all_labels, binary_predictions)
-    f1_at_best_threshold = f1_score(all_labels, binary_predictions)
-
-    print(f"AUROC: {auroc}, AUPR: {aupr}, Precision: {precision_at_best_threshold}, Recall: {recall_at_best_threshold}, F1-score: {f1_at_best_threshold}")
+    # 打印 AUROC
+    print(f"AUROC: {auroc}")
 
 
 class TrnData(data.Dataset):
@@ -287,8 +302,86 @@ def main():
     device = 'cuda:' + args.cuda
 
     train, test = load_data()
+    # Find drugs with connections in test but not in train
+
+    def find_unconnected_drugs(train, test):
+        # Find the drugs in the test set that are connected to at least one gene
+        test_drugs_connected = np.where(test.sum(axis=1) > 0)[0]
+
+        # Find the drugs in the training set that are not connected to any gene
+        train_drugs_unconnected = np.where(train.sum(axis=1) == 0)[0]
+
+        # Find drugs that are connected in the test set but unconnected in the train set
+        drugs_in_test_but_not_train = np.intersect1d(test_drugs_connected, train_drugs_unconnected)
+
+        return drugs_in_test_but_not_train
+    drugs_with_new_connections = find_unconnected_drugs(train, test)
+
+    print("Drugs with connections in the test set but no connections in the training set:", drugs_with_new_connections)
+
+    from scipy.sparse import csr_matrix, lil_matrix
+    import random
+
+    def split_and_add_test_connections_to_train(train, test, drugs_with_new_connections, ratio=0.8):
+        # Convert test to csr_matrix for efficient row indexing
+        test = test.tocsr()
+
+        # Convert train to lil_matrix to support assignment operations
+        train = train.tolil()
+
+        # Dictionary to store train and test pairs for each drug
+        drug_pairs = {drug: [] for drug in drugs_with_new_connections}
+
+        # Find drug-gene pairs for each drug in drugs_with_new_connections
+        for drug in drugs_with_new_connections:
+            gene_connections = test[drug].nonzero()[1]
+            drug_pairs[drug] = [(drug, gene) for gene in gene_connections]
+
+        train_pairs = []
+        test_pairs = []
+
+        # Split connections for each drug individually
+        for drug, pairs in drug_pairs.items():
+            n_connections = len(pairs)
+            if n_connections == 0:
+                continue
+            elif n_connections == 1:
+                # If there's only one connection, always assign it to train
+                train_pairs.extend(pairs)
+            else:
+                # Use random sampling for drugs with more than one connection
+                n_train = max(1, int(n_connections * ratio))  # Ensure at least one connection in train
+                drug_train_pairs = random.sample(pairs, n_train)
+                drug_test_pairs = [pair for pair in pairs if pair not in drug_train_pairs]
+                train_pairs.extend(drug_train_pairs)
+                test_pairs.extend(drug_test_pairs)
+
+        # Add connections to the training set
+        for drug, gene in train_pairs:
+            train[drug, gene] = test[drug, gene]
+
+        # Mask the train pairs in the test set
+        test = test.tolil()  # Convert test to lil_matrix for efficient item assignment
+        for drug, gene in train_pairs:
+            test[drug, gene] = 0
+
+        # Convert both matrices back to csr_matrix for efficient computation
+        train = train.tocsr()
+        test = test.tocsr()
+
+        return train, test
+    # 将 drugs_with_new_connections 的药物-基因对的 80% 添加到训练集中
+    train, remaining_test_pairs = split_and_add_test_connections_to_train(train, test, drugs_with_new_connections)
+
+    drugs_with_new_connections1 = find_unconnected_drugs(train, remaining_test_pairs)
+
+    print("Drugs with connections in the test set but no connections in the training set:", drugs_with_new_connections1)
+
+
     train_coo, test_coo, train_pos_samples, test_pos_samples, train_neg_samples, test_neg_samples = preprocess_data(
-        train, test, args.epoch)
+        train, remaining_test_pairs, args.epoch)
+
+
 
     train_labels = [[] for _ in range(train.shape[0])]
     for i in range(len(train_coo.data)):
@@ -307,21 +400,27 @@ def main():
     train_loader = data.DataLoader(train_data, batch_size=args.inter_batch, shuffle=True, num_workers=0)
 
     adj_norm = scipy_sparse_mat_to_torch_sparse_tensor(train)
-    adj_norm = adj_norm.coalesce().cuda(torch.device(device))
+    adj_norm = adj_norm.coalesce().cuda(torch.device(device)) #10690, 3227
 
 
 
     train_csr = (train != 0).astype(np.float32)
 
-    model = model_diffusion.GCNDDP_diffusion(adj_norm.shape[0], adj_norm.shape[1], args.d, train_csr,
-                                             adj_norm, args.gnn_layer, args.temp, args.lambda1, args.lambda2, args.dropout, device)
+    model = GCNDDP_diffusion(adj_norm.shape[0], adj_norm.shape[1], args.d,train_csr,
+                    adj_norm, args.gnn_layer, args.temp, args.lambda1, args.lambda2, args.dropout, device)
     model.cuda(torch.device(device))
     optimizer = torch.optim.Adam(model.parameters(), weight_decay=0, lr=args.lr)
 
     model, best_model_path, best_epoch = train_model(train_loader, model, optimizer, train_neg_samples, args.epoch, train_data)
 
     # Load the best model for evaluation
-    model.load_state_dict(torch.load(best_model_path))
+    # model.load_state_dict(torch.load(best_model_path))
+
+    # 加载模型和字典
+    checkpoint = torch.load(best_model_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.neg_samples_dict = checkpoint['neg_samples_dict']
+
     print(f'Loaded best model from epoch {best_epoch}')
     evaluate_model(model, test_pos_samples, test_neg_samples)
 
