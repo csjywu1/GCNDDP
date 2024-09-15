@@ -67,48 +67,50 @@ class GCNDDP_diffusion(nn.Module):
 
 
     def forward(self, uids, iids, pos, neg, sampled_gene_gene_relationships, sampled_drug_drug_relationships,  test=False):
-        if test == True:  # testing phase
-            u_emb = self.E_g_GNN[uids]
-            i_emb = self.E_d_GNN[iids]
+         if test == True:  # testing phase
+            i_emb = self.E_g_GNN[uids]  # gene
+            u_emb = self.E_d_GNN[iids]  # drug
 
             # 合并并通过 MLP
             u_i_concat = torch.cat([u_emb, i_emb], dim=-1).unsqueeze(0)
-            pred = self.concat_mlp(u_i_concat).squeeze(-1)
+
+            h_syn = self.diffusion.sample(u_emb.shape, u_emb)  # 扩散过程后，生成合成负样本 (h_syn)，引入基于扩散的额外负样本。 # 这里会生成5个负样本
+            neg_list = []
+            w = [1, 0.6, 0.3, 0.1]  # 这是权重，不同hard的样本有不同的权重
+
+            # 假设 h_syn 是一个列表，每个元素是一个 embedding
+
+            combined_neg_embeddings = torch.zeros_like(h_syn[0])  # 初始化一个和 h_syn[0] 形状相同的全零张量，用于累加加权的负样本嵌入
+
+            for i in range(len(h_syn)):  # 能否生成一个固定sample的列表。现在太慢了
+                weighted_syn_neg = w[i] * h_syn[i]  # 对每个 h_syn[i] 进行加权
+                combined_neg_embeddings += weighted_syn_neg
+
+            u_i_concat1 = torch.cat([u_emb, i_emb], dim=-1).unsqueeze(0)
+
+            u_i_concat2 = torch.cat([u_emb, combined_neg_embeddings], dim=-1).unsqueeze(0)
+
+            # self.concat_mlp(u_i_concat).squeeze(-1)+
+            # pred =  (self.concat_mlp1(u_i_concat1) - self.concat_mlp1 (u_i_concat2))
+            pred = (self.concat_mlp1(u_i_concat1) - self.concat_mlp1(u_i_concat2)).sigmoid() + self.concat_mlp1(u_i_concat1).sigmoid()
 
             return pred, self.E_g_GNN, self.E_d_GNN
         else:  # training phase
             E_d_GNN_0 = self.attention_layer2(self.E_d_GNN_0, sampled_drug_drug_relationships)
-            E_d_GNN_0 = 0.1 * E_d_GNN_0 + self.E_d_GNN_0
-            # E_d_GNN_0 = torch.cat([E_d_GNN_0, self.E_d_GNN_0], dim=-1)
+            E_d_GNN_0 = E_d_GNN_0 + self.E_d_GNN_0
 
-            # E_d_GNN_0 = self.concat_mlp1(E_d_GNN_0)
-
-            # E_d_GNN_0 = self.E_d_GNN_0
-
-            # 假设 gene_gene_relationships 是一个列表或张量，其中包含基因之间的关系
-            # 随机选取 1/10 的基因关系
-            # num_relationships = len(gene_gene_relationships)  # 计算总关系数
-            # sample_size = max(1, num_relationships // 25)  # 确保至少选取1个关系
-            #
-            # # 从 gene_gene_relationships 中随机选取 sample_size 数量的关系
-            # sampled_gene_gene_relationships = random.sample(gene_gene_relationships, sample_size)
             #
             E_g_GNN_0 = self.attention_layer2(self.E_g_GNN_0, sampled_gene_gene_relationships)
-            E_g_GNN_0 = 0.1 * E_g_GNN_0 +  self.E_g_GNN_0
+            E_g_GNN_0 = E_g_GNN_0 + self.E_g_GNN_0
 
+            self.E_d_GNN = torch.spmm(sparse_dropout(self.adj_norm, self.dropout), E_g_GNN_0)
 
+            self.E_g_GNN = torch.spmm(sparse_dropout(self.adj_norm, self.dropout).transpose(0, 1), E_d_GNN_0)
 
-            self.E_g_GNN = torch.spmm(sparse_dropout(self.adj_norm, self.dropout), E_d_GNN_0)
-
-            self.E_d_GNN = torch.spmm(sparse_dropout(self.adj_norm, self.dropout).transpose(0, 1), E_g_GNN_0)
-
-
-
-
-            #交叉熵损失
-            u_emb = self.E_g_GNN[uids]  # 4096,1024 #基因
-            pos_emb = self.E_d_GNN[pos]  # 4096,1024 # 药物
-            neg_emb = self.E_d_GNN[neg]  # 4096,1024 # 药物
+            # 交叉熵损失
+            u_emb = self.E_d_GNN[uids]  # 4096,1024 #药物
+            pos_emb = self.E_g_GNN[pos]  # 4096,1024 # 基因
+            neg_emb = self.E_g_GNN[neg]  # 4096,1024 # 基因
 
             # 正样本和负样本的得分
             u_pos_concat = torch.cat([u_emb, pos_emb], dim=-1)
@@ -127,62 +129,134 @@ class GCNDDP_diffusion(nn.Module):
             loss_neg = F.binary_cross_entropy_with_logits(neg_scores, neg_labels)
 
             # 总的交叉熵损失
-            loss_r = loss_pos + loss_neg
-            loss_r = -(pos_scores - neg_scores).sigmoid().log().mean() + loss_r  # 差值越大越好
+            loss_r = -(pos_scores - neg_scores).sigmoid().log().mean() + loss_pos + loss_neg
+
+            # loss_r = loss_r  # 差值越大越好
+
+            #
 
             # diffusion的损失
-            a = u_emb  # gene
-            b = pos_emb  # drug_pos
-            c = neg_emb  # drug_neg
+            a = u_emb  # drug
+            b = pos_emb  # gene_pos
+            c = neg_emb  # gene_neg
 
-            pos_score = torch.sum(a * b, dim=1)
-            pos_score = -torch.mean(F.sigmoid(pos_score))  # F.logsigmoid(pos))
+            # pos_score = torch.sum(a * b, dim=1)
+            # pos_score = torch.mean(F.sigmoid(pos_score))  # F.logsigmoid(pos))
 
-            neg_score = torch.sum(a * c, dim=1)
-            neg_score = -torch.mean(F.sigmoid(-neg_score))  # F.logsigmoid(-neg)
+            # 假设您已经定义了一个 MLP 网络 self.mlp 用于计算相似度
+
+            # neg_score = self.concat_mlp(torch.cat((a, c), dim=1))  # 用a和c的concat通过mlp计算负样本的分数
+            # neg_score = torch.mean(F.sigmoid(neg_score))  # 负样本的分数通过sigmoid激活后取均值
 
             def train_diffusion():
-                nei_output = self.E_d_GNN[pos].detach()  # 邻居节点的特征
+                nei_output = self.E_g_GNN[pos].detach()  # 邻居节点的特征
                 n_output = self.E_d_GNN[uids].detach()  # 复制成一样的维度
 
-                for epoch in range(3):
+                for epoch in range(100):
                     self.d_optimizer.zero_grad()
-                    dif_loss = self.diffusion(nei_output, n_output, self.device)
+                    dif_loss = self.diffusion(nei_output, n_output, self.device)  # 扩散计算损失
                     dif_loss.backward(retain_graph=True)
                     self.d_optimizer.step()
-                    # print("Diffusion_Loss:", dif_loss.item())
+
                 return
 
-            train_diffusion()
+            if self.i == 1:
+                train_diffusion()
+                self.i = 2
 
-            h_syn = self.diffusion.sample(a.shape, a)  # 扩散过程后，生成合成负样本 (h_syn)，引入基于扩散的额外负样本。
+            h_syn = self.diffusion.sample(a.shape, a)  # 扩散过程后，生成合成负样本 (h_syn)，引入基于扩散的额外负样本。 # 这里会生成5个负样本
             neg_list = []
-            w = [0, 1, 0.9, 0.8, 0.7]
+            w = [1, 0.9, 0.8, 0.7]  # 这是权重，不同hard的样本有不同的权重
+
+            # 假设 h_syn 是一个列表，每个元素是一个 embedding
+
+            combined_neg_embeddings = torch.zeros_like(h_syn[0])  # 初始化一个和 h_syn[0] 形状相同的全零张量，用于累加加权的负样本嵌入
 
             for i in range(len(h_syn)):
-                syn_neg = torch.sum(a * h_syn[i], dim=1)  # 每个合成负损失类似于主要负损失，通过 a 和生成的合成负样本的点积计算，再应用 Sigmoid 函数并求平均。
-                syn_neg = -torch.mean(F.sigmoid(-syn_neg))  # F.logsigmoid(-syn_neg)
-                neg_list.append(w[i] * syn_neg)  # 最终负损失作为 neg_list 中各项损失的加权和计算得出。
+                weighted_syn_neg = w[i] * h_syn[i]  # 对每个 h_syn[i] 进行加权
+                combined_neg_embeddings += weighted_syn_neg  # 这里生成的是gene的负样本 # 将加权后的嵌入逐步累加
 
-            neg_list.append(neg_score)
-            sam = [1 for i in w if i != 0]
-            neg_score = sum(neg_list) / (sum(sam) + 1)
+            # neg_list.append(neg_score)  # 将初始的neg_score加入到neg_list
+            # sam = [1 for i in w if i != 0]  # 计算有效权重的数量
+            # neg_score = sum(neg_list) / (sum(sam) + 1)  # 负样本分数的加权平均
 
-            loss_s = (pos_score + neg_score) / 2  # 最终损失为正损失和负损失的平均值 (loss = (pos + neg)/2)
+            # combined_neg_embeddings =  torch.cat([neg_emb, combined_neg_embeddings], dim = -1)
+            #
+            # combined_neg_embeddings = self.concat_mlp2(combined_neg_embeddings)
 
+            neg_concat = torch.cat([a, combined_neg_embeddings], dim=-1)
+            syn_neg = self.concat_mlp1(neg_concat).squeeze(-1)
 
-            # reg loss
-            # loss_reg 是正则化损失，用于避免模型过拟合，通过对所有参数施加 L2 正则化来实现。
-            loss_reg = 0
-            for param in self.parameters():
-                loss_reg += param.norm(2).square()
-            loss_reg *= self.lambda_2
+            pos_concat = torch.cat([a, b], dim=-1)
+            # 使用交叉熵损失函数计算最终的负样本损失
+            syn_pos = self.concat_mlp1(pos_concat).squeeze(-1)
 
+            loss_s1 = F.binary_cross_entropy_with_logits(syn_neg, torch.zeros_like(neg_labels))  # 用交叉熵计算负样本的损失
+            #
+            loss_s2 = F.binary_cross_entropy_with_logits(syn_pos, torch.ones_like(
+                neg_labels)) + F.binary_cross_entropy_with_logits(neg_scores, neg_labels)
+            # 用交叉熵计算负样本的损失
+
+            loss_s = -(syn_pos - syn_neg).sigmoid().log().mean() + loss_s1 + loss_s2
+
+            # .sigmoid().log().mean() + loss_s1 + loss_s2
+
+            # + loss_s1 + loss_s2
+
+            def compute_consistency_loss(neg_emb, combined_neg_embeddings, loss_type='mse'):
+                """
+                Computes the consistency loss between neg_emb and combined_neg_embeddings.
+
+                Args:
+                    neg_emb (Tensor): The negative embeddings (B, D) where B is batch size and D is the embedding dimension.
+                    combined_neg_embeddings (Tensor): The combined negative embeddings (B, D).
+                    loss_type (str): Type of loss to use ('mse', 'cosine', 'kl').
+
+                Returns:
+                    Tensor: Consistency loss.
+                """
+                if loss_type == 'mse':
+                    # Mean Squared Error Loss
+                    consistency_loss = F.mse_loss(neg_emb, combined_neg_embeddings)
+
+                elif loss_type == 'cosine':
+                    # Cosine Similarity Loss (1 - cosine similarity)
+                    cosine_sim = F.cosine_similarity(neg_emb, combined_neg_embeddings, dim=-1)
+                    consistency_loss = 1 - cosine_sim.mean()
+
+                elif loss_type == 'kl':
+                    # KL Divergence Loss
+                    neg_emb_log_softmax = F.log_softmax(neg_emb, dim=-1)
+                    combined_neg_embeddings_softmax = F.softmax(combined_neg_embeddings, dim=-1)
+                    consistency_loss = F.kl_div(neg_emb_log_softmax, combined_neg_embeddings_softmax,
+                                                reduction='batchmean')
+
+                else:
+                    raise ValueError("Invalid loss_type. Choose from ['mse', 'cosine', 'kl'].")
+
+                return consistency_loss
+
+            consistency_loss = compute_consistency_loss(neg_scores, syn_neg, loss_type='kl')
+
+            # loss_r =  + loss_r  # 差值越大越好
+
+            # F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score)) + \
+
+            # # reg loss
+            # # loss_reg 是正则化损失，用于避免模型过拟合，通过对所有参数施加 L2 正则化来实现。
+            # loss_reg = 0
+            # for param in self.parameters():
+            #     loss_reg += param.norm(2).square()
+            # loss_reg *= self.lambda_2
 
             # total loss
-            loss = loss_reg + self.lambda_1 * loss_s  + loss_r
+            # loss =   loss_r  + 100 *loss_s
+            loss = loss_s
+            # + consistency_loss +loss_s
+            # loss_r +
+            # + loss_r
+            return loss, loss_r, loss_s, consistency_loss
 
-            return loss, loss_r, loss_s
 
 
 
