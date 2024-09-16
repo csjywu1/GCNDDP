@@ -414,7 +414,7 @@ class GCNDDP_diffusion(nn.Module):
             # 合并并通过 MLP
             u_i_concat = torch.cat([u_emb, i_emb], dim=-1).unsqueeze(0)
 
-            h_syn = self.diffusion.sample(u_emb.shape, u_emb)  # 扩散过程后，生成合成负样本 (h_syn)，引入基于扩散的额外负样本。 # 这里会生成5个负样本
+            h_syn = self.diffusion.sample(i_emb.shape, i_emb)  # 扩散过程后，生成合成负样本 (h_syn)，引入基于扩散的额外负样本。 # 这里会生成5个负样本
             neg_list = []
             w = [1, 0.9, 0.8, 0.7]  # 这是权重，不同hard的样本有不同的权重
 
